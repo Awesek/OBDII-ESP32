@@ -13,7 +13,7 @@
  *   - Monitor status (PID $01 -- specialni 4-bytovy bit-encoded format)
  *   - Freeze frame (Mode 02 / Service $02)
  *
- * @author Ales Pouzar (OBD-II bakalarska prace)
+ * @author Ales Pouzar, vycházel jsem z ISO 15031-5/-6, SAE J1979, J2012, a dokumentace a wikipedie pro dostupne PIDs   
  */
 
 #include "obd2_internal.h"
@@ -47,10 +47,10 @@
  *  - O2_CONV: napeti = A * 0.005 V.
  *    Pouziti: PIDy $14--$1B (konvencni O2 senzory), rozsah 0..1.275 V.
  *
- *  - O2_WIDE_EQ_V: ekvivalencni pomer = (256*A + B) * 2/65535.
+ *  - O2_WIDE_EQ_V: ekvivalencni pomer = (256*A + B) * 2/65536.
  *    Pouziti: PIDy $24--$2B (sirokopasme O2 -- napetovy vystup).
  *
- *  - O2_WIDE_EQ_I: ekvivalencni pomer = (256*A + B) * 2/65535.
+ *  - O2_WIDE_EQ_I: ekvivalencni pomer = (256*A + B) * 2/65536.
  *    Pouziti: PIDy $34--$3B (sirokopasme O2 -- proudovy vystup).
  *
  *  - CONFIG: raw byte A jako float, bez skalovania.
@@ -111,22 +111,137 @@ float obd2_decode_pid_value(uint8_t pid, const uint8_t *data, uint8_t data_len)
         return (float)a * 0.005f;
 
     case OBD2_FMT_O2_WIDE_EQ_V:
-        /* Primarni hodnota = ekvivalencni pomer: (256A+B) * 2/65535 */
-        return (float)ab * (2.0f / 65535.0f);
+        /* Primarni hodnota = ekvivalencni pomer: (256A+B) * 2/65536 */
+        return (float)ab * (2.0f / 65536.0f);
 
     case OBD2_FMT_O2_WIDE_EQ_I:
-        /* Primarni hodnota = ekvivalencni pomer: (256A+B) * 2/65535 */
-        return (float)ab * (2.0f / 65535.0f);
+        /* Primarni hodnota = ekvivalencni pomer: (256A+B) * 2/65536 */
+        return (float)ab * (2.0f / 65536.0f);
 
     case OBD2_FMT_CONFIG:
         /* Konfiguracni PIDy: raw A jako float */
         return (float)a;
+
+    case OBD2_FMT_ENUM:
+        /* Vyctovy typ: vraci primo prvni bajt bez posunu */
+        return (float)a;
+
+    case OBD2_FMT_LINEAR_4B: {
+        /* 32-bit unsigned linearni:
+         *   value = ((A<<24) | (B<<16) | (C<<8) | D) * mult + offset
+         * Pouziti: $A6 odometer (km*10), $7F engine run time. */
+        if (data_len < 4) return NAN;
+        uint32_t v = ((uint32_t)a << 24) | ((uint32_t)b << 16) |
+                     ((uint32_t)c << 8)  | (uint32_t)d;
+        return (float)v * desc->multiplier + desc->offset;
+    }
+
+    case OBD2_FMT_TEMP_4S:
+    case OBD2_FMT_NOX_4S:
+        /* Multi-sensor formaty: primarni hodnota = senzor 1, ostatni
+         * dekoduje obd2_get_pid() pres obd2_decode_pid_extras(). */
+        if (data_len < 3) return NAN;
+        if (desc->format == OBD2_FMT_TEMP_4S) {
+            uint8_t support = a;
+            if (!(support & 0x01)) return NAN; /* senzor 1 nepodporovan */
+            uint16_t bc = ((uint16_t)b << 8) | c;
+            return (float)bc * 0.1f - 40.0f;
+        } else {
+            /* NOX_4S: senzor 1 = (256B+C) ppm; 0xFFFF = invalid */
+            uint8_t support = a;
+            if (!(support & 0x01)) return NAN;
+            uint16_t bc = ((uint16_t)b << 8) | c;
+            if (bc == 0xFFFF) return NAN;
+            return (float)bc;
+        }
+
+    case OBD2_FMT_RAW:
+        /* RAW format: hodnota neni dekodovana. Frontend zobrazi raw bajty.
+         * Vracime NAN — klient pozna podle isnan() ze nema hodnotu. */
+        return NAN;
 
     default:
         OBD2_LOGE("decode_pid_value: unknown format %d for pid 0x%02X",
                   desc->format, pid);
         return NAN;
     }
+}
+
+/**
+ * @brief Dekoduje 3. a 4. hodnotu pro multi-sensor PIDy ($78, $79, $83, $98...).
+ *
+ * Pro PIDy formatu TEMP_4S a NOX_4S vrati senzor 3 (extra[0]) a senzor 4
+ * (extra[1]). Pokud senzor neni podporovan (support bit = 0) nebo je hodnota
+ * neplatna (0xFFFF u NOx), vraci NAN.
+ *
+ * Vraci pocet validnich hodnot (1-4) — value, secondary, extra[0..1].
+ *
+ * @param pid       Cislo PIDu
+ * @param data      Raw data byty (alespon 9 bytu pro multi-sensor)
+ * @param data_len  Pocet validnich bytu
+ * @param extra     Pole 2 floatu pro senzory 3 a 4 (musi byt non-NULL)
+ * @return Pocet validnich hodnot (1 az 4) v decoded structuie
+ */
+uint8_t obd2_decode_pid_extras(uint8_t pid, const uint8_t *data,
+                               uint8_t data_len, float *extra)
+{
+    if (data == NULL || extra == NULL) {
+        if (extra) { extra[0] = NAN; extra[1] = NAN; }
+        return 1;
+    }
+
+    extra[0] = NAN;
+    extra[1] = NAN;
+
+    const obd2_pid_desc_t *desc = obd2_get_pid_descriptor(pid);
+    if (desc == NULL) return 1;
+
+    if (desc->format != OBD2_FMT_TEMP_4S && desc->format != OBD2_FMT_NOX_4S) {
+        if (pid >= 0x55 && pid <= 0x58 && data_len >= 2) {
+            return 2;
+        }
+        /* Skalarni / O2 formaty maji 1-2 hodnoty (value + secondary).
+         * Skalarni: 1 hodnota. O2: 2 hodnoty (kdyz secondary neni NAN). */
+        if (desc->format == OBD2_FMT_O2_CONV ||
+            desc->format == OBD2_FMT_O2_WIDE_EQ_V ||
+            desc->format == OBD2_FMT_O2_WIDE_EQ_I) {
+            return 2;
+        }
+        return 1;
+    }
+
+    /* Multi-sensor: 9 bytu (1 byte podpora + 4× 2 byty hodnota) */
+    if (data_len < 9) return 1;
+
+    uint8_t support = data[0];
+    uint8_t valid_count = (support & 0x01) ? 1 : 0;
+
+    /* Senzor 2 — uz je v 'secondary' field, jen rozhodneme, jestli pocitat */
+    if (support & 0x02) valid_count++;
+
+    /* Senzor 3 = bajty F, G (data[5], data[6]) */
+    if (support & 0x04) {
+        uint16_t fg = ((uint16_t)data[5] << 8) | data[6];
+        if (desc->format == OBD2_FMT_TEMP_4S) {
+            extra[0] = (float)fg * 0.1f - 40.0f;
+        } else if (fg != 0xFFFF) {
+            extra[0] = (float)fg;
+        }
+        valid_count++;
+    }
+
+    /* Senzor 4 = bajty H, I (data[7], data[8]) */
+    if (support & 0x08) {
+        uint16_t hi = ((uint16_t)data[7] << 8) | data[8];
+        if (desc->format == OBD2_FMT_TEMP_4S) {
+            extra[1] = (float)hi * 0.1f - 40.0f;
+        } else if (hi != 0xFFFF) {
+            extra[1] = (float)hi;
+        }
+        valid_count++;
+    }
+
+    return valid_count > 0 ? valid_count : 1;
 }
 
 /**
@@ -142,12 +257,12 @@ float obd2_decode_pid_value(uint8_t pid, const uint8_t *data, uint8_t data_len)
  *
  *  - O2_WIDE_EQ_V (PIDy $24--$2B):
  *    Primarni = ekvivalencni pomer,
- *    sekundarni = napeti = (256*C + D) * 8/65535 [V].
+ *    sekundarni = napeti = (256*C + D) * 8/65536 [V].
  *    Rozsah: 0 az 8 V.
  *
  *  - O2_WIDE_EQ_I (PIDy $34--$3B):
  *    Primarni = ekvivalencni pomer,
- *    sekundarni = proud = (int16_t)(256*C + D) * 128/32768 [mA].
+ *    sekundarni = proud = (256*C + D) / 256 - 128 [mA].
  *    Dle Annex B: $8000 = 0 mA, rozsah -128 az +127.996 mA.
  *
  *  - Vsechny ostatni formaty: vraci NAN (nemaji sekundarni hodnotu).
@@ -175,18 +290,41 @@ float obd2_decode_pid_secondary(uint8_t pid, const uint8_t *data,
     uint16_t cd = ((uint16_t)c << 8) | d;
 
     switch (desc->format) {
+    case OBD2_FMT_SIGNED_OFFSET_1B:
+        if (pid >= 0x55 && pid <= 0x58 && data_len >= 2) {
+            return ((float)b - 128.0f) * (100.0f / 128.0f);
+        }
+        return NAN;
+
     case OBD2_FMT_O2_CONV:
         /* Sekundarni = STFT: (B - 128) * 100/128 % */
+        /* ISO 15031-5: If B == 0xFF, the sensor is not used in trim calculation */
+        if (b == 0xFF) return NAN;
         return ((float)b - 128.0f) * (100.0f / 128.0f);
 
     case OBD2_FMT_O2_WIDE_EQ_V:
-        /* Sekundarni = napeti: (256C+D) * 8/65535 V */
-        return (float)cd * (8.0f / 65535.0f);
+        /* Sekundarni = napeti: (256C+D) * 8/65536 V */
+        return (float)cd * (8.0f / 65536.0f);
 
     case OBD2_FMT_O2_WIDE_EQ_I:
-        /* Sekundarni = proud: (int16_t)(256C+D) * 256/65535 - 128 mA */
+        /* Sekundarni = proud: (256C+D) / 256 - 128 mA */
         /* Dle Annex B: $8000 = 0 mA, rozsah -128 az +127.996 */
-        return ((float)(int16_t)cd) * (128.0f / 32768.0f);
+        return ((float)cd / 256.0f) - 128.0f;
+
+    case OBD2_FMT_TEMP_4S:
+    case OBD2_FMT_NOX_4S:
+        /* Multi-sensor: senzor 2 = bajty D, E (data[3], data[4]).
+         * Podporu indikuje bit 1 v bajtu A (data[0]). */
+        if (data_len < 5) return NAN;
+        if (!(data[0] & 0x02)) return NAN; /* senzor 2 nepodporovan */
+        {
+            uint16_t de = ((uint16_t)data[3] << 8) | data[4];
+            if (desc->format == OBD2_FMT_TEMP_4S) {
+                return (float)de * 0.1f - 40.0f;
+            }
+            if (de == 0xFFFF) return NAN;
+            return (float)de;
+        }
 
     default:
         return NAN;
@@ -266,17 +404,22 @@ obd2_status_t obd2_get_pid_raw(uint8_t pid, obd2_pid_raw_t *result)
         return OBD2_ERR_RESPONSE_MALFORMED;
     }
 
-    /* Extrakce datovych bytu (preskoceni SID + PID) */
+    /* Extrakce datovych bytu (preskoceni SID + PID).
+     * Buffer pokryva i multi-sensor a dlouhe J1979-DA PIDy. */
     result->pid = pid;
-    result->data_len = (resp_len - 2 > 4) ? 4 : (uint8_t)(resp_len - 2);
+    uint16_t avail = (resp_len > 2) ? (resp_len - 2) : 0;
+    result->data_len = (avail > OBD2_PID_MAX_DATA_BYTES)
+                       ? OBD2_PID_MAX_DATA_BYTES
+                       : (uint8_t)avail;
     memcpy(result->data, &resp[2], result->data_len);
 
-    OBD2_LOGD("get_pid_raw: pid=0x%02X data_len=%u data=[%02X %02X %02X %02X]",
+    OBD2_LOGD("get_pid_raw: pid=0x%02X data_len=%u data=[%02X %02X %02X %02X%s]",
               pid, result->data_len,
               result->data[0],
               result->data_len > 1 ? result->data[1] : 0,
               result->data_len > 2 ? result->data[2] : 0,
-              result->data_len > 3 ? result->data[3] : 0);
+              result->data_len > 3 ? result->data[3] : 0,
+              result->data_len > 4 ? "..." : "");
 
     return OBD2_OK;
 }
@@ -287,6 +430,7 @@ obd2_status_t obd2_get_pid_raw(uint8_t pid, obd2_pid_raw_t *result)
  * Kombinuje obd2_get_pid_raw() a obd2_decode_pid_value()/obd2_decode_pid_secondary()
  * do jednoho volani. Vysledek obsahuje:
  *  - pid: cislo PIDu
+ *  - raw_data/raw_data_len: puvodni datove bajty A..N z ECU odpovedi
  *  - value: dekodovana primarni hodnota (napr. teplota ve stupnich, otacky v RPM)
  *  - secondary: sekundarni hodnota (pouze pro O2 PIDy, jinak NAN)
  *  - name: lidsky citelny nazev PIDu (napr. "Engine RPM")
@@ -315,14 +459,20 @@ obd2_status_t obd2_get_pid(uint8_t pid, obd2_pid_decoded_t *result)
     /* Vyhledani deskriptoru v tabulce */
     const obd2_pid_desc_t *desc = obd2_get_pid_descriptor(pid);
 
+    memset(result, 0, sizeof(*result));
     result->pid = pid;
+    result->raw_data_len = raw.data_len;
+    memcpy(result->raw_data, raw.data, raw.data_len);
     result->value = obd2_decode_pid_value(pid, raw.data, raw.data_len);
     result->secondary = obd2_decode_pid_secondary(pid, raw.data, raw.data_len);
+    result->value_count = obd2_decode_pid_extras(pid, raw.data, raw.data_len,
+                                                  result->extra);
     result->name = desc ? desc->name : "Unknown PID";
     result->unit = desc ? desc->unit : "";
 
-    OBD2_LOGI("get_pid: pid=0x%02X \"%s\" = %.3f %s",
-              pid, result->name, result->value, result->unit);
+    OBD2_LOGI("get_pid: pid=0x%02X \"%s\" = %.3f %s (count=%u)",
+              pid, result->name, result->value, result->unit,
+              result->value_count);
 
     return OBD2_OK;
 }
@@ -391,6 +541,8 @@ obd2_status_t obd2_get_monitor_status(const uint8_t *raw,
         return OBD2_ERR_INVALID_ARG;
     }
 
+    memset(status, 0, sizeof(*status));
+
     uint8_t data[4];
 
     if (raw != NULL) {
@@ -404,39 +556,64 @@ obd2_status_t obd2_get_monitor_status(const uint8_t *raw,
         memcpy(data, pid_raw.data, 4);
     }
 
+    memcpy(status->raw, data, sizeof(status->raw));
+
     /* Byte A: pocet DTC (bity 0-6) a MIL (bit 7) */
     status->dtc_count = data[0] & 0x7F;
     status->mil_on    = (data[0] & 0x80) != 0;
 
-    /* Byte B dolni nibble: podpora kontinualnich monitoru */
+    /* Byte B: common/continuous monitors.
+     * B0-B2 = support, B3 = ignition type, B4-B6 = not complete (0=ready). */
+    status->is_compression = (data[1] & 0x08) != 0;
+    
     status->misfire_sup  = (data[1] & 0x01) != 0;
     status->fuel_sys_sup = (data[1] & 0x02) != 0;
     status->ccm_sup      = (data[1] & 0x04) != 0;
 
-    /* Byte B horni nibble: stav kontinualnich monitoru (invertovany: 0=dokoncen) */
     status->misfire_rdy  = (data[1] & 0x10) == 0;
     status->fuel_sys_rdy = (data[1] & 0x20) == 0;
     status->ccm_rdy      = (data[1] & 0x40) == 0;
 
-    /* Byte C: podpora nekontinualnich monitoru */
-    status->cat_sup  = (data[2] & 0x01) != 0;
-    status->hcat_sup = (data[2] & 0x02) != 0;
-    status->evap_sup = (data[2] & 0x04) != 0;
-    status->air_sup  = (data[2] & 0x08) != 0;
-    status->acrf_sup = (data[2] & 0x10) != 0;
-    status->o2s_sup  = (data[2] & 0x20) != 0;
-    status->htr_sup  = (data[2] & 0x40) != 0;
-    status->egr_sup  = (data[2] & 0x80) != 0;
+    /* Byte C & D: podpora a stav nekontinualnich monitoru (lisi se podle typu motoru) */
+    if (!status->is_compression) {
+        /* Zazehozy motor (Spark / Benzin) */
+        status->cat_sup  = (data[2] & 0x01) != 0;
+        status->hcat_sup = (data[2] & 0x02) != 0;
+        status->evap_sup = (data[2] & 0x04) != 0;
+        status->air_sup  = (data[2] & 0x08) != 0;
+        status->acrf_sup = (data[2] & 0x10) != 0;
+        status->o2s_sup  = (data[2] & 0x20) != 0;
+        status->htr_sup  = (data[2] & 0x40) != 0;
+        status->egr_sup  = (data[2] & 0x80) != 0;
 
-    /* Byte D: stav nekontinualnich monitoru (invertovany: 0=dokoncen) */
-    status->cat_rdy  = (data[3] & 0x01) == 0;
-    status->hcat_rdy = (data[3] & 0x02) == 0;
-    status->evap_rdy = (data[3] & 0x04) == 0;
-    status->air_rdy  = (data[3] & 0x08) == 0;
-    status->acrf_rdy = (data[3] & 0x10) == 0;
-    status->o2s_rdy  = (data[3] & 0x20) == 0;
-    status->htr_rdy  = (data[3] & 0x40) == 0;
-    status->egr_rdy  = (data[3] & 0x80) == 0;
+        status->cat_rdy  = (data[3] & 0x01) == 0;
+        status->hcat_rdy = (data[3] & 0x02) == 0;
+        status->evap_rdy = (data[3] & 0x04) == 0;
+        status->air_rdy  = (data[3] & 0x08) == 0;
+        status->acrf_rdy = (data[3] & 0x10) == 0;
+        status->o2s_rdy  = (data[3] & 0x20) == 0;
+        status->htr_rdy  = (data[3] & 0x40) == 0;
+        status->egr_rdy  = (data[3] & 0x80) == 0;
+    } else {
+        /* Vznetovy motor (Compression / Nafta) */
+        /* Poznamka: Pole ve strukture jsou pojmenovana podle benzinu,
+           ale norma prirazuje bity dieselu takto: */
+        status->cat_sup  = (data[2] & 0x01) != 0; /* NMHC Catalyst */
+        status->hcat_sup = (data[2] & 0x02) != 0; /* NOx/SCR Aftertreatment */
+        /* evap_sup (bit 2) je u dieselu reserved */
+        status->air_sup  = (data[2] & 0x08) != 0; /* Boost Pressure */
+        /* acrf_sup (bit 4) je u dieselu reserved */
+        status->o2s_sup  = (data[2] & 0x20) != 0; /* Exhaust Gas Sensor */
+        status->htr_sup  = (data[2] & 0x40) != 0; /* PM Filter */
+        status->egr_sup  = (data[2] & 0x80) != 0; /* EGR and/or VVT */
+
+        status->cat_rdy  = (data[3] & 0x01) == 0;
+        status->hcat_rdy = (data[3] & 0x02) == 0;
+        status->air_rdy  = (data[3] & 0x08) == 0;
+        status->o2s_rdy  = (data[3] & 0x20) == 0;
+        status->htr_rdy  = (data[3] & 0x40) == 0;
+        status->egr_rdy  = (data[3] & 0x80) == 0;
+    }
 
     OBD2_LOGI("monitor_status: MIL=%s DTCs=%u",
               status->mil_on ? "ON" : "OFF", status->dtc_count);
@@ -445,6 +622,61 @@ obd2_status_t obd2_get_monitor_status(const uint8_t *raw,
               status->o2s_rdy ? 'Y' : 'N', status->egr_rdy  ? 'Y' : 'N');
 
     return OBD2_OK;
+}
+
+/**
+ * @brief Multi-ECU varianta cteni readiness/monitor status pres broadcast.
+ *
+ * Posle Mode 01 PID 01 na 0x7DF a sesbira monitor status od vsech ECU.
+ * Kazda ECU ma vlastni sadu readiness monitoru — napr. ECM hlasi stav
+ * CAT/EVAP/O2S, TCM jen relevantni pro prevodovku. Hlavni use-case:
+ * emisni kontrola (overit, ze VSECHNY emisne-relevantni ECU jsou ready).
+ *
+ * Dekodovaci logika je znovu pouzita z obd2_get_monitor_status() — predava
+ * se 4-bajtovy buffer [A,B,C,D] z pozice [2] kazde odpovedi.
+ *
+ * @param list  Vystupni seznam per-ECU monitor status
+ * @return OBD2_OK pri uspechu, OBD2_ERR_NO_DATA pokud zadna ECU neodpovedela
+ */
+obd2_status_t obd2_get_monitor_status_all(obd2_monitor_status_list_t *list)
+{
+    OBD2_LOGI("get_monitor_status_all");
+
+    if (list == NULL) {
+        OBD2_LOGE("get_monitor_status_all: NULL pointer");
+        return OBD2_ERR_INVALID_ARG;
+    }
+    if (!_ctx.initialized) {
+        OBD2_LOGE("get_monitor_status_all: not initialized");
+        return OBD2_ERR_NOT_INITIALIZED;
+    }
+
+    memset(list, 0, sizeof(obd2_monitor_status_list_t));
+
+    uint8_t req[2] = { OBD2_SID_CURRENT_DATA, 0x01 };
+    static isotp_result_t bcast_result;
+
+    obd2_status_t st = _obd2_request_multi(req, 2, &bcast_result, _ctx.timeout_ms);
+    if (st != OBD2_OK) return st;
+
+    uint8_t expected_resp_sid = OBD2_SID_CURRENT_DATA + OBD2_SID_RESPONSE_OFFSET;
+
+    for (uint8_t i = 0; i < bcast_result.count && list->count < ISOTP_MAX_ECU_RESPONSES; i++) {
+        isotp_response_t *r = &bcast_result.responses[i];
+        /* Minimalni format: [41, 01, A, B, C, D] = 6 B */
+        if (!r->valid || r->len < 6) continue;
+        if (r->data[0] != expected_resp_sid || r->data[1] != 0x01) continue;
+
+        obd2_ecu_monitor_status_item_t *item = &list->items[list->count];
+        item->rx_id = r->rx_id;
+
+        /* Dekodovaci logika je sdilena s obd2_get_monitor_status() */
+        obd2_get_monitor_status(&r->data[2], &item->status);
+
+        list->count++;
+    }
+
+    return (list->count > 0) ? OBD2_OK : OBD2_ERR_NO_DATA;
 }
 
 /* ========================================================================= */
