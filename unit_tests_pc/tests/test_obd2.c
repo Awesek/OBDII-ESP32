@@ -645,6 +645,99 @@ void test_obd2_clear_dtc_not_initialized(void)
 }
 
 /* ========================================================================= */
+/*  Test 21: VIN malformed - prilis kratka odpoved                           */
+/* ========================================================================= */
+
+/*
+ * EOBD vozidla ne vzdy podporuji VIN. Nektera ECU vrati zkracenou odpoved
+ * (napr. jen 4 znaky misto 17). Implementace musi takovou odpoved odmitnout
+ * s OBD2_ERR_RESPONSE_MALFORMED, ne ji tise prijmout (jinak by vystup
+ * obsahoval nahodne bajty).
+ *
+ * SF len=7 je maximalni platny SF (1 B PCI + 7 B dat). Payload obsahuje
+ *   [49 02 01 'W' 'V' 'W' '?']
+ *  = SID/InfoType/NODI + jen 4 znaky VIN. Po stripnuti hlavicky zustanou
+ *    4 bajty, coz je < OBD2_VIN_LENGTH (17) -> MALFORMED.
+ */
+void test_obd2_read_vin_short_response_is_malformed(void)
+{
+    setup_obd2();
+
+    mock_twai_inject_rx_frame(0x7E8,
+        0x07, 0x49, 0x02, 0x01, 'W', 'V', 'W', '?');
+
+    char vin[OBD2_VIN_LENGTH + 1];
+    obd2_status_t st = obd2_read_vin(vin, sizeof(vin));
+    TEST_ASSERT_EQUAL_INT(OBD2_ERR_RESPONSE_MALFORMED, st);
+
+    teardown_obd2();
+}
+
+/* ========================================================================= */
+/*  Test 22: DTC truncation - count vetsi nez max_count                       */
+/* ========================================================================= */
+
+/*
+ * ECU posle 3 DTC, ale tester ma misto pro pouze 2. Implementace musi
+ * vlozit prvni 2 do pole a vratit count=2 (NE zapsat za hranice pole!).
+ *
+ * Response: [08 43 03 01 00 01 31 03 00]   - SF|len=8, 3 DTCs
+ *            P0100, P0131, P0300
+ */
+void test_obd2_read_dtc_truncates_to_max_count(void)
+{
+    setup_obd2();
+
+    /* Pravdive: payload 8 bajtu, 3 DTC -> potrebuje multi-frame. */
+    mock_twai_inject_rx_frame(0x7E8,
+        0x10, 0x08, 0x43, 0x03, 0x01, 0x00, 0x01, 0x31);
+    mock_twai_inject_rx_frame(0x7E8,
+        0x21, 0x03, 0x00, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC);
+
+    /* Buffer pro pouze 2 DTC + sentinel pro overeni, ze se nezapisuje za hranice. */
+    obd2_dtc_t dtcs[3];
+    memset(&dtcs[2], 0xFE, sizeof(obd2_dtc_t));  /* sentinel ve treti pozici */
+
+    uint8_t count = 0;
+    obd2_status_t st = obd2_read_dtc(dtcs, 2, &count);
+
+    TEST_ASSERT_EQUAL_INT(OBD2_OK, st);
+    TEST_ASSERT_EQUAL_INT(2, count);
+    TEST_ASSERT_STRING_EQUAL("P0100", dtcs[0].code);
+    TEST_ASSERT_STRING_EQUAL("P0131", dtcs[1].code);
+
+    /* Sentinel ve dtcs[2] nesmi byt prepsany — ochrana pred overflow. */
+    TEST_ASSERT_EQUAL_HEX(0xFE, dtcs[2].raw[0]);
+    TEST_ASSERT_EQUAL_HEX(0xFE, dtcs[2].raw[1]);
+
+    teardown_obd2();
+}
+
+/* ========================================================================= */
+/*  Test 23: get_pid_raw - prilis kratka odpoved                              */
+/* ========================================================================= */
+
+/*
+ * ECU posle odpoved [02 41 0C] (jen 3 bajty: SID+PID, zadna data). Implementace
+ * musi takovou odpoved odmitnout s OBD2_ERR_RESPONSE_MALFORMED — nesmi zapsat
+ * 0 bajtu do data[] a vracet OK, ani nic horsiho.
+ */
+void test_obd2_get_pid_raw_response_too_short(void)
+{
+    setup_obd2();
+
+    /* Odpoved bez datovych bajtu */
+    mock_twai_inject_rx_frame(0x7E8,
+        0x02, 0x41, 0x0C, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC);
+
+    obd2_pid_raw_t raw;
+    obd2_status_t st = obd2_get_pid_raw(0x0C, &raw);
+    TEST_ASSERT_EQUAL_INT(OBD2_ERR_RESPONSE_MALFORMED, st);
+
+    teardown_obd2();
+}
+
+/* ========================================================================= */
 /*  Registr testu pro test_main.c                                            */
 /* ========================================================================= */
 
@@ -683,4 +776,9 @@ void run_obd2_tests(void)
 
     /* Zivotni cyklus */
     RUN_TEST(test_obd2_init_is_idempotent);
+
+    /* Malformovane vstupy / hranicni pripady */
+    RUN_TEST(test_obd2_read_vin_short_response_is_malformed);
+    RUN_TEST(test_obd2_read_dtc_truncates_to_max_count);
+    RUN_TEST(test_obd2_get_pid_raw_response_too_short);
 }
