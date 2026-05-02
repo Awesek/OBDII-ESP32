@@ -5,6 +5,11 @@
 ![Protocol](https://img.shields.io/badge/OBD--II-ISO--15765--4-green.svg)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 
+## Dashboard Preview
+
+![Main Dashboard](Figures/Testing/Testing_upload_version_02_05/DASH_auto_stoji_motor_off.png)
+
+
 An ESP32-based wireless OBD-II diagnostic scanner. This project implements the OBD-II standard (ISO 15765-4 via CAN bus) and provides a real-time web-based dashboard accessible over Wi-Fi using WebSockets.
 
 This project was developed as a part of a Bachelor's thesis implementation.
@@ -18,6 +23,19 @@ This project was developed as a part of a Bachelor's thesis implementation.
   - **Core 1** handles OBD-II CAN bus communication using FreeRTOS tasks, avoiding interference with the Wi-Fi stack.
 - **Thread-safe FreeRTOS Integration:** Safely passes data between cores using FreeRTOS queues.
 - **Protocols Supported:** ISO-TP transport protocol over CAN, implementing standard OBD-II services.
+
+### Key Features Showcase
+
+| Comprehensive Mode Support | Emission Readiness Monitors |
+| :---: | :---: |
+| ![Diagnostic Modes](Figures/Testing/Testing_upload_version_02_05/DIAG_VYBER_MODES.png) | ![Monitor Status](Figures/Testing/Testing_upload_version_02_05/DIAG_MODE_1_Monitor_Status.png) |
+| **All Essential Services** <br> Full support for ISO 15031-5 / SAE J1979 diagnostic modes (01-0A). | **Monitor Status** <br> Clear, real-time overview of continuous and non-continuous emission monitors. |
+
+| Vehicle Configuration | Raw CAN & ISO-TP Inspector |
+| :---: | :---: |
+| ![Vehicle Configuration](Figures/Testing/Testing_upload_version_02_05/CFG_NOT_OPTIMALISED.png) | ![Raw Data](Figures/Testing/Testing_upload_version_02_05/PID_inspector_RAW.png) |
+| **Custom Vehicle Profiles** <br> Adjustable engine parameters to tailor internal calculations to specific vehicle types. | **Developer Raw Mode** <br> Real-time deep dive into raw CAN hex frames and ISO-TP payload details. |
+
 
 ## Hardware Requirements
 
@@ -174,6 +192,18 @@ To compile this project in the Arduino IDE, you will need to install the followi
 4. Open a web browser and navigate to `http://192.168.4.1`.
 5. The web dashboard will load and automatically attempt to establish a WebSocket connection. Once connected, interact with the UI to initialize CAN communication and start reading real-time engine data.
 
+## Testing & Validation
+
+Comprehensive testing was conducted to ensure protocol stability and UI responsiveness. Detailed visual documentation and technical evidence of these tests are available in the repository:
+
+- **[Latest Testing Gallery (May 2nd, 2026)](Figures/Testing/Testing_upload_version_02_05/)** – Complete set of screenshots from the latest stable version, covering all diagnostic modes, real-time telemetry, and system logs.
+- **[Testing Archive](Figures/Testing/)** – Historical testing data and earlier development versions used for validation during the development process.
+
+These screenshots serve as technical evidence of the implementation's functionality.
+
+
 ## License
 
-This project is provided for educational and academic purposes as part of a Bachelor's thesis.
+This project is licensed under the [MIT License](LICENSE).
+
+Note: This project was originally developed as a Bachelor's thesis implementation. While it is open-source, it is provided as-is for educational and diagnostic purposes. Use at your own risk on real vehicles.
